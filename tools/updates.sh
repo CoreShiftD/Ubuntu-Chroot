@@ -158,9 +158,9 @@ EOF
     apt-get autoremove -y && apt-get clean
 
     # Update post_exec.sh for binfmt-support
-    if ! grep -q "binfmt-support" /data/local/ubuntu-chroot/post_exec.sh 2>/dev/null; then
+    if ! grep -q "binfmt-support" /mnt/rootfs/post_exec.sh 2>/dev/null; then
         echo "[UPDATER] Updating post_exec.sh for binfmt-support..."
-        cat >> /data/local/ubuntu-chroot/post_exec.sh << 'EOF'
+        cat >> /mnt/rootfs/post_exec.sh << 'EOF'
 
 # Start binfmt service
 service binfmt-support start
@@ -184,8 +184,8 @@ update_v2520() {
         return 1
     fi
 
-    if ! grep -q "udev" /data/local/ubuntu-chroot/post_exec.sh; then
-        if ! echo -e '# Ugly hack to start the udev service\nservice udev restart > /dev/null 2>&1 &' >> /data/local/ubuntu-chroot/post_exec.sh; then
+    if ! grep -q "udev" /mnt/rootfs/post_exec.sh; then
+        if ! echo -e '# Ugly hack to start the udev service\nservice udev restart > /dev/null 2>&1 &' >> /mnt/rootfs/post_exec.sh; then
             error "Failed to update post_exec.sh for udev"
             return 1
         fi

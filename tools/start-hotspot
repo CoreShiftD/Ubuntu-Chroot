@@ -7,8 +7,8 @@ DNS_SERVER1=$(getprop net.dns1)
 [ -z "$DNS_SERVER1" ] && DNS_SERVER1=8.8.8.8
 PHY_IFACE="wlan0"
 AP_IFACE="ap0"
-BASE_CHROOT_DIR="/data/local/ubuntu-chroot"
-CHROOT_PATH="${BASE_CHROOT_DIR}/rootfs"
+BASE_CHROOT_DIR="/data/local/droidian"
+CHROOT_PATH="/mnt/rootfs"
 HOLDER_PID_FILE="${BASE_CHROOT_DIR}/holder.pid"
 
 # Hotspot configuration variables
@@ -42,7 +42,7 @@ fi
 LOGGING_ENABLED=${LOGGING_ENABLED:-0}
 
 if [ "$LOGGING_ENABLED" -eq 1 ]; then
-    LOG_DIR="${CHROOT_PATH%/*}/logs"
+    LOG_DIR="${BASE_CHROOT_DIR}/logs"
     mkdir -p "$LOG_DIR"
     LOG_FILE="$LOG_DIR/$SCRIPT_NAME.txt"
     LOG_FIFO="$LOG_DIR/$SCRIPT_NAME.fifo"

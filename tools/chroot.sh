@@ -10,18 +10,59 @@
 # --- Configuration and Global Variables ---
 
 # Use environment variable if set, otherwise use default path
-BASE_CHROOT_DIR="/data/local/ubuntu-chroot"
-CHROOT_PATH="${BASE_CHROOT_DIR}/rootfs"
+BASE_CHROOT_DIR="/data/local/droidian"
+CHROOT_PATH="/mnt/rootfs"
 ROOTFS_IMG="${BASE_CHROOT_DIR}/rootfs.img"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(dirname "$0")"
-C_HOSTNAME="ubuntu"
+C_HOSTNAME="droidian"
 MOUNTED_FILE="${BASE_CHROOT_DIR}/mount.points"
 POST_EXEC_SCRIPT="${BASE_CHROOT_DIR}/post_exec.sh"
 HOLDER_PID_FILE="${BASE_CHROOT_DIR}/holder.pid"
 SILENT=0
 SKIP_POST_EXEC=0
 CHROOT_SETUP_IN_PROGRESS=0
+
+# initd binary path (bind-mounted into chroot at /opt/bin)
+INITD_BIN_DIR="${BASE_CHROOT_DIR}/initd"
+
+# Network isolation via separate net namespace + veth pair
+NET_ISOLATION=${NET_ISOLATION:-true}
+NET_NS_MASK="24"
+# User-configured third octet, e.g. "100" → host 172.28.100.1, chroot 172.28.100.2
+# Leave empty to randomize per boot
+NET_NS_IP=""
+NET_NS_NET="172.28.0.0"
+NET_NS_HOST_IP="172.28.0.1"
+NET_NS_CHROOT_IP="172.28.0.2"
+NET_VETH_HOST="veth-host"
+NET_VETH_CHROOT="veth-chroot"
+
+# Load experimental.conf if present to pick up IMAGES etc.
+EXPERIMENTAL_CONF="${BASE_CHROOT_DIR}/experimental.conf"
+[ -f "$EXPERIMENTAL_CONF" ] && . "$EXPERIMENTAL_CONF" 2>/dev/null
+
+# Parse IMAGES config (space-separated list of dev[:mountpoint])
+# First entry without mountpoint (or with :/) becomes the rootfs device.
+# Subsequent entries are extra block/image mounts inside the chroot.
+IMAGES_EXTRA_FILE="${BASE_CHROOT_DIR}/images.extra"
+IMAGES_EXTRA_MOUNTED="${BASE_CHROOT_DIR}/images.extra.mounted"
+
+if [ -n "$IMAGES" ]; then
+    RAW_BLOCK_DEVICE=""
+    rm -f "$IMAGES_EXTRA_FILE"
+    for _entry in $IMAGES; do
+        _dev="${_entry%%:*}"
+        _mnt="${_entry#*:}"
+        [ "$_mnt" = "$_dev" ] && _mnt=""
+        if [ -z "$RAW_BLOCK_DEVICE" ] && { [ -z "$_mnt" ] || [ "$_mnt" = "/" ]; }; then
+            RAW_BLOCK_DEVICE="$_dev"
+        else
+            [ -n "$_mnt" ] && echo "$_dev:$_mnt" >> "$IMAGES_EXTRA_FILE"
+        fi
+    done
+    [ -n "$RAW_BLOCK_DEVICE" ] && ROOTFS_IMG="$RAW_BLOCK_DEVICE"
+fi
 
 # --- Busybox resolution (must happen before logging block) ---
 if [ -x "$BASE_CHROOT_DIR/bin/busybox" ]; then
@@ -37,7 +78,7 @@ fi
 LOGGING_ENABLED=${LOGGING_ENABLED:-0}
 
 if [ "$LOGGING_ENABLED" -eq 1 ]; then
-    LOG_DIR="${CHROOT_PATH%/*}/logs"
+    LOG_DIR="${BASE_CHROOT_DIR}/logs"
     mkdir -p "$LOG_DIR"
     LOG_FILE="$LOG_DIR/$SCRIPT_NAME.txt"
     LOG_FIFO="$LOG_DIR/$SCRIPT_NAME.fifo"
@@ -110,6 +151,7 @@ _get_ns_flags() {
             --uts)   short_flags="$short_flags -u" ;;
             --ipc)   short_flags="$short_flags -i" ;;
             --pid)   short_flags="$short_flags -p" ;;
+            --net)   short_flags="$short_flags -n" ;;
             # Ignore flags that nsenter doesn't need or support
             --cgroup|--fork) ;;
         esac
@@ -207,17 +249,19 @@ advanced_mount() {
 
     if [ "$type" = "bind" ]; then
         [ -e "$src" ] || { warn "Source for bind mount does not exist: $src"; return 1; }
-        run_in_ns mount --bind "$src" "$tgt"
+        run_in_ns mount --bind "$src" "$tgt" && {
+            log "Mounted $src -> $tgt ($type)"
+            echo "$tgt" >> "$MOUNTED_FILE"
+            return 0
+        }
     else
-        run_in_ns mount -t "$type" $opts "$type" "$tgt"
+        run_in_ns mount -t "$type" $opts "$type" "$tgt" && {
+            log "Mounted $src -> $tgt ($type)"
+            echo "$tgt" >> "$MOUNTED_FILE"
+            return 0
+        }
     fi
-
-    if [ $? -eq 0 ]; then
-        log "Mounted $src -> $tgt ($type)"
-        echo "$tgt" >> "$MOUNTED_FILE"
-    else
-        error "Failed to mount $src"
-    fi
+    error "Failed to mount $src"
 }
 
 setup_storage() {
@@ -236,6 +280,18 @@ setup_storage() {
     else
         warn "Android storage not found at $storage_path"
     fi
+}
+
+detect_image_fstype() {
+    local img="$1"
+    local magic
+    # f2fs magic at offset 0: 0xF2F52010 (on disk: 10 20 F5 F2)
+    magic=$("${BUSYBOX}" dd if="$img" bs=1 count=4 2>/dev/null | "${BUSYBOX}" od -An -tx1 | tr -d ' \n')
+    [ "$magic" = "1020f5f2" ] && echo "f2fs" && return
+    # ext4 superblock magic at offset 1024+56=1080: 0xEF53 (on disk: 53 EF)
+    magic=$("${BUSYBOX}" dd if="$img" bs=1 skip=1080 count=2 2>/dev/null | "${BUSYBOX}" od -An -tx1 | tr -d ' \n')
+    [ "$magic" = "53ef" ] && echo "ext4" && return
+    echo "ext4"
 }
 
 run_fstrim() {
@@ -393,36 +449,34 @@ kill_chroot_processes() {
 # --- REWRITTEN create_namespace ---
 create_namespace() {
     local pid_file="$1"
-    local unshare_flags="" # Flags for the unshare command
-    local nsenter_flags="" # Flags to save for nsenter
+    local unshare_flags=""
+    local nsenter_flags=""
 
-    # Test each namespace individually and build flags dynamically
-    for ns_flag in --pid --mount --uts --ipc; do
+    # Probe each namespace individually (source of truth)
+    for ns_flag in --pid --mount --uts --ipc --net --cgroup; do
         if unshare "$ns_flag" true 2>/dev/null; then
             unshare_flags+=" $ns_flag"
         fi
     done
 
-    # nsenter_flags should be identical to unshare_flags
     nsenter_flags="$unshare_flags"
 
-    # Ensure we have at least mount namespace
     if ! echo "$unshare_flags" | grep -q -- "--mount"; then
         error "Mount namespace not supported - cannot create chroot"
         return 1
     fi
 
-    # Report unsupported namespaces if debug mode is enabled
     if [ "$LOGGING_ENABLED" -eq 1 ]; then
-        for ns in --pid --mount --uts --ipc; do
+        for ns in --pid --mount --uts --ipc --net --cgroup; do
             if ! echo "$unshare_flags" | grep -qw -- "$ns"; then
-                # Map namespace flag to config name
                 local config_name=""
                 case "$ns" in
-                    --pid) config_name="CONFIG_PID_NS" ;;
+                    --pid)   config_name="CONFIG_PID_NS" ;;
                     --mount) config_name="CONFIG_MNT_NS" ;;
-                    --uts) config_name="CONFIG_UTS_NS" ;;
-                    --ipc) config_name="CONFIG_IPC_NS" ;;
+                    --uts)   config_name="CONFIG_UTS_NS" ;;
+                    --ipc)   config_name="CONFIG_IPC_NS" ;;
+                    --net)   config_name="CONFIG_NET_NS" ;;
+                    --cgroup) config_name="CONFIG_CGROUP_NS" ;;
                 esac
                 warn "${ns#--} namespace not enabled in the kernel ($config_name)"
             fi
@@ -430,8 +484,6 @@ create_namespace() {
     fi
 
     log "using flags: $unshare_flags"
-
-    # Save the long-form flags. _get_ns_flags will translate them later.
     echo "$nsenter_flags" > "${pid_file}.flags"
 
     # Run a subshell within the new namespaces.
@@ -454,10 +506,106 @@ create_namespace() {
     return 1
 }
 
+# --- Network namespace isolation (veth pair + NAT) ---
+setup_net_namespace() {
+    local holder_pid
+    holder_pid=$(cat "$HOLDER_PID_FILE" 2>/dev/null)
+
+    # Randomize third octet so each boot gets a unique 172.28.X.0/24 subnet.
+    # User can pin a fixed third octet via NET_NS_IP in experimental.conf (0-255).
+    local octet3="${NET_NS_IP:-$((RANDOM % 256))}"
+    NET_NS_NET="172.28.$octet3.0"
+    NET_NS_HOST_IP="172.28.$octet3.1"
+    NET_NS_CHROOT_IP="172.28.$octet3.2"
+    if [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null; then
+        warn "Namespace holder not running - cannot set up net isolation"
+        return 1
+    fi
+
+    local ns_flags
+    ns_flags=$(cat "${HOLDER_PID_FILE}.flags" 2>/dev/null)
+    if ! echo "$ns_flags" | grep -q -- "--net"; then
+        warn "Net namespace not enabled - cannot set up net isolation"
+        return 1
+    fi
+
+    if ! command -v ip >/dev/null 2>&1; then
+        warn "ip command not found - cannot set up net isolation"
+        return 1
+    fi
+
+    # We run in the host namespace after create_namespace returns.
+    # All commands here execute directly in init's network namespace.
+
+    log "Setting up network namespace isolation..."
+
+    if ip link show "$NET_VETH_HOST" >/dev/null 2>&1; then
+        log "veth pair already exists, skipping setup"
+        return 0
+    fi
+
+    # Ensure IP forwarding is enabled in the host netns
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+
+    # Create veth pair
+    if ! ip link add "$NET_VETH_HOST" type veth peer name "$NET_VETH_CHROOT"; then
+        warn "Failed to create veth pair"
+        return 1
+    fi
+
+    # Move chroot end from host namespace into the chroot's namespace
+    if ! ip link set "$NET_VETH_CHROOT" netns "$holder_pid"; then
+        warn "Failed to move veth-chroot into namespace"
+        ip link delete "$NET_VETH_HOST" 2>/dev/null
+        return 1
+    fi
+
+    # Configure host side
+    ip link set "$NET_VETH_HOST" up 2>/dev/null
+    if ! ip addr add "$NET_NS_HOST_IP/$NET_NS_MASK" dev "$NET_VETH_HOST" 2>/dev/null; then
+        local err
+        err=$(ip addr add "$NET_NS_HOST_IP/$NET_NS_MASK" dev "$NET_VETH_HOST" 2>&1)
+        warn "Failed to assign IP to host veth: $err"
+        ip link delete "$NET_VETH_HOST" 2>/dev/null
+        return 1
+    fi
+
+    # Disable rp_filter on the host veth
+    echo 0 > /proc/sys/net/ipv4/conf/${NET_VETH_HOST}/rp_filter 2>/dev/null || true
+
+    # NAT/masquerade
+    iptables -t nat -C POSTROUTING -s "$NET_NS_NET/$NET_NS_MASK" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -I POSTROUTING -s "$NET_NS_NET/$NET_NS_MASK" -j MASQUERADE 2>/dev/null && log "NAT masquerade enabled" || true
+    iptables -C FORWARD -i "$NET_VETH_HOST" -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD -i "$NET_VETH_HOST" -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -o "$NET_VETH_HOST" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -I FORWARD -o "$NET_VETH_HOST" -j ACCEPT 2>/dev/null || true
+
+    # Configure chroot side (inside the chroot's netns)
+    "${BUSYBOX}" nsenter --target "$holder_pid" -n -- ip addr add "$NET_NS_CHROOT_IP/$NET_NS_MASK" dev "$NET_VETH_CHROOT" 2>/dev/null || {
+        warn "Failed to assign IP to chroot veth"
+        return 1
+    }
+    "${BUSYBOX}" nsenter --target "$holder_pid" -n -- ip link set "$NET_VETH_CHROOT" up
+    "${BUSYBOX}" nsenter --target "$holder_pid" -n -- ip link set lo up
+    "${BUSYBOX}" nsenter --target "$holder_pid" -n -- ip route add default via "$NET_NS_HOST_IP" 2>/dev/null
+
+    log "Network namespace isolation ready: chroot @ $NET_NS_CHROOT_IP (NAT to host @ $NET_NS_HOST_IP)"
+    return 0
+}
+
+teardown_net_namespace() {
+    log "Tearing down network namespace isolation..."
+    iptables -t nat -D POSTROUTING -s "$NET_NS_NET/$NET_NS_MASK" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i "$NET_VETH_HOST" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "$NET_VETH_HOST" -j ACCEPT 2>/dev/null || true
+    ip link delete "$NET_VETH_HOST" 2>/dev/null && log "veth pair removed" || true
+}
+
 start_chroot() {
     log "Setting up advanced chroot environment..."
 
-    (setenforce 0 && log "SELinux set to permissive mode") || warn "Failed to set SELinux to permissive mode"
+    log "Using SELinux policy rules from sepolicy.rule"
 
     # Set flag to prevent recursion
     CHROOT_SETUP_IN_PROGRESS=1
@@ -480,10 +628,15 @@ start_chroot() {
         log "Running in isolated namespace (PID: $(cat "$HOLDER_PID_FILE"))"
     fi
 
-    [ -d "$CHROOT_PATH" ] || { error "Chroot directory not found at $CHROOT_PATH"; CHROOT_SETUP_IN_PROGRESS=0; exit 1; }
+    mkdir -p "$CHROOT_PATH" || { error "Failed to create chroot directory at $CHROOT_PATH"; CHROOT_SETUP_IN_PROGRESS=0; exit 1; }
 
-    if [ -f "$ROOTFS_IMG" ]; then
-        log "Sparse image detected"
+    if [ -f "$ROOTFS_IMG" ] || [ -b "$ROOTFS_IMG" ]; then
+        if [ -b "$ROOTFS_IMG" ]; then
+            log "Raw block device detected: $ROOTFS_IMG"
+        else
+            log "Sparse image detected"
+        fi
+
         if mountpoint -q "$CHROOT_PATH" 2>/dev/null; then
             log "Sparse image already mounted, unmounting first..."
             if umount -f "$CHROOT_PATH" 2>/dev/null || umount -l "$CHROOT_PATH" 2>/dev/null; then
@@ -493,37 +646,55 @@ start_chroot() {
             fi
         fi
 
-        # Ugly fix for users who already have a sparse image without a journal
-        if ! tune2fs -l "$ROOTFS_IMG" | grep -q "has_journal"; then
-            log "Sparse image does not have journal - Enabling..."
-            tune2fs -O has_journal "$ROOTFS_IMG"
-            tune2fs -o journal_data_writeback "$ROOTFS_IMG"
-        fi
+        # Detect filesystem type
+        local IMG_FSTYPE
+        IMG_FSTYPE=$(detect_image_fstype "$ROOTFS_IMG")
+        log "Detected filesystem type: $IMG_FSTYPE"
 
-        # Check and repair filesystem before mounting to prevent kernel panics
-        log "Checking filesystem integrity..."
-        local fsck_output=$(e2fsck -f -y "$ROOTFS_IMG" 2>&1)
-        local fsck_exit=$?
+        if [ "$IMG_FSTYPE" = "ext4" ]; then
+            # Ugly fix for users who already have a sparse image without a journal
+            if ! tune2fs -l "$ROOTFS_IMG" | grep -q "has_journal"; then
+                log "Sparse image does not have journal - Enabling..."
+                tune2fs -O has_journal "$ROOTFS_IMG"
+                tune2fs -o journal_data_writeback "$ROOTFS_IMG"
+            fi
 
-        # Exit codes: 0=no errors, 1=corrected, 2=corrected/reboot, 4+=failed
-        if [ $fsck_exit -ge 4 ]; then
-            error "Filesystem check failed (exit: $fsck_exit)"
-            error "Output: $fsck_output"
-            error "Filesystem corruption detected - cannot safely mount"
-            CHROOT_SETUP_IN_PROGRESS=0
-            exit 1
-        elif [ $fsck_exit -ne 0 ]; then
-            log "Filesystem check corrected issues (exit: $fsck_exit)"
-        else
-            log "Filesystem integrity verified"
+            # Check and repair filesystem before mounting to prevent kernel panics
+            log "Checking filesystem integrity..."
+            local fsck_output=$(e2fsck -f -y "$ROOTFS_IMG" 2>&1)
+            local fsck_exit=$?
+
+            # Exit codes: 0=no errors, 1=corrected, 2=corrected/reboot, 4+=failed
+            if [ $fsck_exit -ge 4 ]; then
+                error "Filesystem check failed (exit: $fsck_exit)"
+                error "Output: $fsck_output"
+                error "Filesystem corruption detected - cannot safely mount"
+                CHROOT_SETUP_IN_PROGRESS=0
+                exit 1
+            elif [ $fsck_exit -ne 0 ]; then
+                log "Filesystem check corrected issues (exit: $fsck_exit)"
+            else
+                log "Filesystem integrity verified"
+            fi
+        elif [ "$IMG_FSTYPE" = "f2fs" ]; then
+            log "Checking f2fs filesystem integrity..."
+            if command -v fsck.f2fs >/dev/null 2>&1; then
+                fsck.f2fs "$ROOTFS_IMG" 2>&1 || log "fsck.f2fs reported issues (non-critical)"
+            else
+                log "fsck.f2fs not available - skipping f2fs check"
+            fi
         fi
 
         # Small delay to ensure filesystem operations complete
         sleep 1
 
-        log "Mounting sparse image to rootfs..."
-        if ! run_in_ns mount -t ext4 -o loop,rw,noatime,nodiratime,errors=remount-ro "$ROOTFS_IMG" "$CHROOT_PATH"; then
-            error "Failed to mount sparse image"
+        # Build mount options based on filesystem type
+        local mount_opts="loop,rw,suid,dev,exec,noatime,nodiratime"
+        [ "$IMG_FSTYPE" = "ext4" ] && mount_opts="$mount_opts,errors=remount-ro"
+
+        log "Mounting sparse image ($IMG_FSTYPE) to rootfs..."
+        if ! run_in_ns mount -t "$IMG_FSTYPE" -o "$mount_opts" "$ROOTFS_IMG" "$CHROOT_PATH"; then
+            error "Failed to mount sparse image (type: $IMG_FSTYPE)"
             CHROOT_SETUP_IN_PROGRESS=0
             exit 1
         else
@@ -560,9 +731,32 @@ start_chroot() {
         fi
     fi
 
+    # Set up network namespace isolation if enabled
+    if [ "$NET_ISOLATION" = "true" ]; then
+        setup_net_namespace
+    fi
+
+    # Mount initd binaries into chroot if present
+    if [ -d "$INITD_BIN_DIR" ]; then
+        run_in_ns mkdir -p "$CHROOT_PATH/opt/bin"
+        if run_in_ns mount -o bind "$INITD_BIN_DIR" "$CHROOT_PATH/opt/bin"; then
+            log "Mounted initd binaries to /opt/bin"
+            echo "$CHROOT_PATH/opt/bin" >> "$MOUNTED_FILE"
+        else
+            warn "Failed to mount initd binaries"
+        fi
+    fi
+
     rm -f "$MOUNTED_FILE"
 
-    run_in_ns mount -o remount,suid /data 2>/dev/null && log "Remounted /data with suid" || warn "Failed to remount /data with suid"
+    # Remount parent filesystem with suid if using directory-based rootfs
+    if [ -z "$ROOTFS_IMG" ] && [ -d "$CHROOT_PATH" ] && ! mountpoint -q "$CHROOT_PATH" 2>/dev/null; then
+        local parent_fs
+        parent_fs=$(df -P "$CHROOT_PATH" 2>/dev/null | awk 'NR==2{print $6}')
+        if [ -n "$parent_fs" ]; then
+            run_in_ns mount -o remount,suid "$parent_fs" 2>/dev/null && log "Remounted $parent_fs with suid" || warn "Failed to remount $parent_fs with suid"
+        fi
+    fi
 
     log "Setting up system mounts..."
     advanced_mount "proc" "$CHROOT_PATH/proc" "proc" "-o rw,nosuid,nodev,noexec,relatime"
@@ -600,21 +794,27 @@ start_chroot() {
 
     log "Setting up minimal cgroups for Docker..."
     run_in_ns mkdir -p "$CHROOT_PATH/sys/fs/cgroup"
-    if run_in_ns mount -t tmpfs -o mode=755 tmpfs "$CHROOT_PATH/sys/fs/cgroup" 2>/dev/null; then
-        echo "$CHROOT_PATH/sys/fs/cgroup" >> "$MOUNTED_FILE"
-        run_in_ns mkdir -p "$CHROOT_PATH/sys/fs/cgroup/devices"
-        if grep -q devices /proc/cgroups 2>/dev/null; then
-            if run_in_ns mount -t cgroup -o devices cgroup "$CHROOT_PATH/sys/fs/cgroup/devices" 2>/dev/null; then
-                log "Cgroup devices mounted successfully."
-                echo "$CHROOT_PATH/sys/fs/cgroup/devices" >> "$MOUNTED_FILE"
-            else
-                warn "Failed to mount cgroup devices."
-            fi
+    if grep -q cgroup2 /proc/filesystems 2>/dev/null; then
+        if run_in_ns mount -t cgroup2 cgroup2 "$CHROOT_PATH/sys/fs/cgroup" 2>/dev/null; then
+            log "Cgroup v2 mounted."
         else
-            warn "Devices cgroup controller not available."
+            warn "Failed to mount cgroup2, falling back to v1."
         fi
-    else
-        warn "Failed to mount cgroup tmpfs."
+    fi
+    if ! grep -q cgroup2 /proc/mounts 2>/dev/null; then
+        if run_in_ns mount -t tmpfs -o mode=755 tmpfs "$CHROOT_PATH/sys/fs/cgroup" 2>/dev/null; then
+            echo "$CHROOT_PATH/sys/fs/cgroup" >> "$MOUNTED_FILE"
+            for ctrl in devices cpu cpuacct cpuset memory blkio pids; do
+                if grep -q "$ctrl" /proc/cgroups 2>/dev/null; then
+                    mkdir -p "$CHROOT_PATH/sys/fs/cgroup/$ctrl"
+                    if run_in_ns mount -t cgroup -o "$ctrl" cgroup "$CHROOT_PATH/sys/fs/cgroup/$ctrl" 2>/dev/null; then
+                        echo "$CHROOT_PATH/sys/fs/cgroup/$ctrl" >> "$MOUNTED_FILE"
+                    fi
+                fi
+            done
+        else
+            warn "Failed to mount cgroup tmpfs."
+        fi
     fi
 
     setup_storage
@@ -634,6 +834,31 @@ start_chroot() {
     sysctl -w kernel.shmmax=268435456 >/dev/null 2>&1
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 
+    # Mount extra IMAGES entries (block devices or image files) inside chroot
+    if [ -f "$IMAGES_EXTRA_FILE" ]; then
+        log "Mounting extra IMAGES entries..."
+        rm -f "$IMAGES_EXTRA_MOUNTED"
+        while IFS=: read -r _dev _mnt; do
+            [ -z "$_dev" ] && continue
+            [ -z "$_mnt" ] && continue
+            _target="$CHROOT_PATH/$_mnt"
+            log "Mounting extra device $_dev at $_target"
+            if [ -b "$_dev" ] || [ -f "$_dev" ]; then
+                _fstype=$(detect_image_fstype "$_dev")
+                run_in_ns mkdir -p "$_target" 2>/dev/null
+                if run_in_ns mount -t "$_fstype" -o loop,rw,noatime,nodiratime "$_dev" "$_target"; then
+                    echo "$_target" >> "$IMAGES_EXTRA_MOUNTED"
+                    echo "$_target" >> "$MOUNTED_FILE"
+                    log "Mounted extra device $_dev -> $_target ($_fstype)"
+                else
+                    error "Failed to mount extra device $_dev at $_target"
+                fi
+            else
+                warn "Extra IMAGES entry not found (not a block device or file): $_dev"
+            fi
+        done < "$IMAGES_EXTRA_FILE"
+    fi
+
     if [ "$SKIP_POST_EXEC" -eq 0 ] && [ -f "$POST_EXEC_SCRIPT" ] && [ -x "$POST_EXEC_SCRIPT" ]; then
         log "Running post-execution script..."
         SCRIPT_B64=$("${BUSYBOX}" base64 -w 0 "$POST_EXEC_SCRIPT")
@@ -651,10 +876,12 @@ start_chroot() {
 stop_chroot() {
     log "Stopping chroot environment..."
 
-    # Run fstrim on sparse image before stopping if using sparse method
+    # Run fstrim on sparse image before stopping if using image/block method
     if [ -f "$ROOTFS_IMG" ]; then
         log "Running fstrim on sparse image before stopping..."
         run_fstrim >/dev/null 2>&1 || warn "fstrim failed during stop operation"
+    elif [ -b "$RAW_BLOCK_DEVICE" ]; then
+        log "Skipping fstrim for raw block device"
     fi
 
     # Stop binfmt_misc service if running
@@ -663,6 +890,11 @@ stop_chroot() {
 
     kill_chroot_processes
     umount_chroot
+
+    # Tear down network namespace isolation if active
+    if [ "$NET_ISOLATION" = "true" ]; then
+        teardown_net_namespace
+    fi
 
     # Kill namespace holder process
     if [ -f "$HOLDER_PID_FILE" ]; then
@@ -680,6 +912,16 @@ stop_chroot() {
 }
 
 umount_chroot() {
+
+    # Unmount extra IMAGES mounts first (reverse order)
+    if [ -f "$IMAGES_EXTRA_MOUNTED" ]; then
+        log "Unmounting extra IMAGES entries..."
+        sort -r "$IMAGES_EXTRA_MOUNTED" | while read -r _mnt; do
+            run_in_ns umount -lf "$_mnt" >/dev/null 2>&1 || true
+            log "Unmounted extra mount: $_mnt"
+        done
+        rm -f "$IMAGES_EXTRA_MOUNTED"
+    fi
 
     # Define custom Linux mounts in reverse order (deepest first)
     custom_linux_mounts=(
@@ -717,14 +959,14 @@ umount_chroot() {
         log "All chroot mounts unmounted."
     fi
 
-    if [ -f "$ROOTFS_IMG" ] && mountpoint -q "$CHROOT_PATH" 2>/dev/null; then
-        log "Force unmounting sparse image..."
+    if { [ -f "$ROOTFS_IMG" ] || [ -b "$ROOTFS_IMG" ]; } && mountpoint -q "$CHROOT_PATH" 2>/dev/null; then
+        log "Force unmounting image..."
         if umount -f "$CHROOT_PATH" 2>/dev/null; then
-            log "Sparse image force unmounted successfully."
+            log "Image force unmounted successfully."
         elif umount -l "$CHROOT_PATH" 2>/dev/null; then
-            log "Sparse image lazy unmounted successfully."
+            log "Image lazy unmounted successfully."
         else
-            warn "Failed to unmount sparse image."
+            warn "Failed to unmount image."
         fi
     fi
 }
@@ -817,7 +1059,7 @@ backup_chroot() {
     local tar_exit_code=1 # Default to failure
 
     if [ -f "$ROOTFS_IMG" ]; then
-        # --- Sparse Image Method ---
+        # --- Sparse/Block Image Method ---
         # Mount the image cleanly and temporarily, outside of any namespace.
         log "Using sparse image backup method."
         local temp_mount_point="${CHROOT_PATH}_bkmnt"
@@ -845,8 +1087,11 @@ backup_chroot() {
             # Small delay to ensure filesystem operations complete
             sleep 1
 
+            local IMG_FSTYPE
+            IMG_FSTYPE=$(detect_image_fstype "$ROOTFS_IMG")
+
             # Mount the image read-only for safety.
-            if mount -t ext4 -o loop,ro "$ROOTFS_IMG" "$temp_mount_point"; then
+            if mount -t "$IMG_FSTYPE" -o loop,ro "$ROOTFS_IMG" "$temp_mount_point"; then
                 log "Sparse image mounted cleanly for backup."
 
                 # Run tar on the clean, temporary mount without any namespace.
@@ -902,6 +1147,10 @@ resize_sparse() {
         exit 1
     fi
 
+    if [ -b "$ROOTFS_IMG" ]; then
+        error "Cannot resize a raw block device"
+        exit 1
+    fi
     if [ ! -f "$ROOTFS_IMG" ]; then
         error "Sparse image not found at $ROOTFS_IMG"
         exit 1
@@ -979,31 +1228,60 @@ resize_sparse() {
         sleep 1
     fi
 
+    # Detect filesystem type
+    local IMG_FSTYPE
+    IMG_FSTYPE=$(detect_image_fstype "$ROOTFS_IMG")
+    log "Detected filesystem type for resize: $IMG_FSTYPE"
+
     # Filesystem check
     log "Checking filesystem integrity..."
-    local fsck_output=$(e2fsck -f -y "$ROOTFS_IMG" 2>&1)
-    local fsck_exit=$?
-
-    # Exit codes: 0=no errors, 1=corrected, 2=corrected/reboot, 4+=failed
-    if [ $fsck_exit -ge 4 ]; then
-        error "Filesystem check failed (exit: $fsck_exit)"
-        error "Output: $fsck_output"
-        exit 1
+    local fsck_output=""
+    local fsck_exit=0
+    if [ "$IMG_FSTYPE" = "ext4" ]; then
+        fsck_output=$(e2fsck -f -y "$ROOTFS_IMG" 2>&1)
+        fsck_exit=$?
+        # Exit codes: 0=no errors, 1=corrected, 2=corrected/reboot, 4+=failed
+        if [ $fsck_exit -ge 4 ]; then
+            error "Filesystem check failed (exit: $fsck_exit)"
+            error "Output: $fsck_output"
+            exit 1
+        fi
+        [ $fsck_exit -ne 0 ] && log "Filesystem check corrected issues (exit: $fsck_exit)"
+    elif [ "$IMG_FSTYPE" = "f2fs" ]; then
+        if command -v fsck.f2fs >/dev/null 2>&1; then
+            fsck_output=$(fsck.f2fs "$ROOTFS_IMG" 2>&1) || log "fsck.f2fs reported issues"
+        else
+            log "fsck.f2fs not available - skipping check"
+        fi
     fi
-    [ $fsck_exit -ne 0 ] && log "Filesystem check corrected issues (exit: $fsck_exit)"
 
     # Resize filesystem
     log "Resizing filesystem to ${new_size_gb}G..."
-    local resize_output=$(resize2fs "$ROOTFS_IMG" "${new_size_gb}G" 2>&1)
-    local resize_exit=$?
-
-    if [ $resize_exit -ne 0 ] && ! echo "$resize_output" | grep -q "is now.*blocks long"; then
-        error "Filesystem resize failed (exit: $resize_exit)"
-        error "Output: $resize_output"
-        error "Restore from backup immediately"
-        exit 1
+    local resize_exit=0
+    if [ "$IMG_FSTYPE" = "ext4" ]; then
+        local resize_output=$(resize2fs "$ROOTFS_IMG" "${new_size_gb}G" 2>&1)
+        resize_exit=$?
+        if [ $resize_exit -ne 0 ] && ! echo "$resize_output" | grep -q "is now.*blocks long"; then
+            error "Filesystem resize failed (exit: $resize_exit)"
+            error "Output: $resize_output"
+            error "Restore from backup immediately"
+            exit 1
+        fi
+        [ $resize_exit -ne 0 ] && log "Resize completed with warnings"
+    elif [ "$IMG_FSTYPE" = "f2fs" ]; then
+        if command -v resize.f2fs >/dev/null 2>&1; then
+            local resize_output=$(resize.f2fs "$ROOTFS_IMG" 2>&1)
+            resize_exit=$?
+            if [ $resize_exit -ne 0 ]; then
+                error "f2fs resize failed (exit: $resize_exit)"
+                error "Output: $resize_output"
+                exit 1
+            fi
+        else
+            error "resize.f2fs not available - cannot resize f2fs images"
+            exit 1
+        fi
     fi
-    [ $resize_exit -ne 0 ] && log "Resize completed with warnings"
 
     # Truncate for shrinking
     if [ "$operation" = "SHRINKING" ]; then
@@ -1019,7 +1297,7 @@ resize_sparse() {
 
     # Verify by test mounting
     log "Verifying filesystem integrity..."
-    if mount -t ext4 -o loop,ro "$ROOTFS_IMG" "$CHROOT_PATH" 2>/dev/null; then
+    if mount -t "$IMG_FSTYPE" -o loop,ro "$ROOTFS_IMG" "$CHROOT_PATH" 2>/dev/null; then
         umount "$CHROOT_PATH" 2>/dev/null
         log "Filesystem verification successful"
     else
@@ -1054,14 +1332,16 @@ restore_chroot() {
     if is_chroot_running; then
         log "Stopping running chroot..."; stop_chroot;
     fi
-    if [ -f "$ROOTFS_IMG" ] && mountpoint -q "$CHROOT_PATH" 2>/dev/null; then
-        log "Force unmounting sparse image..."
+    if { [ -f "$ROOTFS_IMG" ] || [ -b "$ROOTFS_IMG" ]; } && mountpoint -q "$CHROOT_PATH" 2>/dev/null; then
+        log "Force unmounting image..."
         umount -f "$CHROOT_PATH" 2>/dev/null || umount -l "$CHROOT_PATH" 2>/dev/null || {
-            error "Failed to unmount sparse image"; exit 1;
+            error "Failed to unmount image"; exit 1;
         }
     fi
-    if [ -f "$ROOTFS_IMG" ]; then
-        log "Removing sparse image file..."; rm -f "$ROOTFS_IMG" || { error "Failed to remove sparse image file"; exit 1; };
+    if [ -f "$ROOTFS_IMG" ] && [ ! -b "$ROOTFS_IMG" ]; then
+        log "Removing image file..."; rm -f "$ROOTFS_IMG" || { error "Failed to remove image file"; exit 1; };
+    elif [ -b "$ROOTFS_IMG" ]; then
+        log "Skipping removal of raw block device"
     fi
     if [ -d "$CHROOT_PATH" ]; then
         log "Removing existing chroot directory...";
@@ -1129,9 +1409,11 @@ uninstall_chroot() {
 
     # Step 4: It's now safe to delete all files.
     log "All checks passed. Removing chroot files from disk..."
-    if [ -f "$ROOTFS_IMG" ]; then
+    if [ -f "$ROOTFS_IMG" ] && [ ! -b "$ROOTFS_IMG" ]; then
         log "Removing sparse image file: $ROOTFS_IMG"
         rm -f "$ROOTFS_IMG" || { error "Failed to remove sparse image file."; exit 1; }
+    elif [ -b "$ROOTFS_IMG" ]; then
+        log "Skipping removal of raw block device: $ROOTFS_IMG"
     fi
 
     if [ -d "$CHROOT_PATH" ]; then

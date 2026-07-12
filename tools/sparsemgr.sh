@@ -4,7 +4,7 @@
 # Usage: sparsemgr.sh [options] <command> [args]
 
 # Default configuration - can be overridden
-DEFAULT_CHROOT_DIR="/data/local/ubuntu-chroot"
+DEFAULT_CHROOT_DIR="/mnt/rootfs"
 CHROOT_DIR="${CHROOT_DIR:-$DEFAULT_CHROOT_DIR}"
 SCRIPT_NAME="$(basename "$0")"
 
@@ -15,11 +15,16 @@ while [ $# -gt 0 ]; do
             CHROOT_DIR="$2"
             shift 2
             ;;
+        --fstype|-t)
+            FSTYPE="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [options] <command> [args]"
             echo ""
             echo "Options:"
             echo "  --chroot-dir DIR, -d DIR    Set chroot directory (default: $DEFAULT_CHROOT_DIR)"
+            echo "  --fstype TYPE, -t TYPE      Filesystem type: ext4 (default) or f2fs"
             echo ""
             echo "Commands:"
             echo "  migrate <size_gb>           Migrate to sparse image"
@@ -30,6 +35,7 @@ while [ $# -gt 0 ]; do
             echo "Examples:"
             echo "  $0 migrate 8"
             echo "  $0 --chroot-dir /custom/path migrate 16"
+            echo "  $0 --fstype f2fs migrate 8"
             echo "  CHROOT_DIR=/custom/path $0 migrate 8"
             exit 0
             ;;
@@ -53,7 +59,7 @@ fi
 LOGGING_ENABLED=${LOGGING_ENABLED:-0}
 
 if [ "$LOGGING_ENABLED" -eq 1 ]; then
-    LOG_DIR="${CHROOT_DIR%/*}/logs"
+    LOG_DIR="${CHROOT_DIR}/logs"
     mkdir -p "$LOG_DIR"
     LOG_FILE="$LOG_DIR/$SCRIPT_NAME.txt"
     LOG_FIFO="$LOG_DIR/$SCRIPT_NAME.fifo"
@@ -102,17 +108,29 @@ stop_chroot_if_running() {
     fi
 }
 
+# Parse filesystem type argument
+FSTYPE="ext4"
+
 # Check for required tools
 check_requirements() {
     log "Checking for required tools..."
 
-    # Check for mkfs.ext4 or mke2fs
-    if ! command -v mkfs.ext4 >/dev/null 2>&1 && ! command -v mke2fs >/dev/null 2>&1; then
-        error "mkfs.ext4 or mke2fs not found. Cannot format ext4 filesystem."
+    if [ "$FSTYPE" = "ext4" ]; then
+        if ! command -v mkfs.ext4 >/dev/null 2>&1 && ! command -v mke2fs >/dev/null 2>&1; then
+            error "mkfs.ext4 or mke2fs not found. Cannot format ext4 filesystem."
+            exit 1
+        fi
+    elif [ "$FSTYPE" = "f2fs" ]; then
+        if ! command -v mkfs.f2fs >/dev/null 2>&1; then
+            error "mkfs.f2fs not found. Cannot format f2fs filesystem."
+            exit 1
+        fi
+    else
+        error "Unsupported filesystem type: $FSTYPE (supported: ext4, f2fs)"
         exit 1
     fi
 
-    log "All required tools found"
+    log "All required tools found ($FSTYPE)"
     return 0
 }
 
@@ -173,27 +191,34 @@ create_sparse_image() {
     "${BUSYBOX}" sync
     "${BUSYBOX}" sleep 1
 
-    log "Formatting sparse image with ext4..."
-    # Try mkfs.ext4 first, fallback to mke2fs
-    if command -v mkfs.ext4 >/dev/null 2>&1; then
-        if ! mkfs.ext4 -F -L "ubuntu-chroot" "$img_path" 2>&1; then
+    log "Formatting sparse image with $FSTYPE..."
+    if [ "$FSTYPE" = "ext4" ]; then
+        if command -v mkfs.ext4 >/dev/null 2>&1; then
+        if ! mkfs.ext4 -F -L "droidian" "$img_path" 2>&1; then
             error "Failed to format sparse image with mkfs.ext4"
+                "${BUSYBOX}" rm -f "$img_path"
+                return 1
+            fi
+        elif command -v mke2fs >/dev/null 2>&1; then
+            if ! mke2fs -t ext4 -F -L "droidian" "$img_path" 2>&1; then
+                error "Failed to format sparse image with mke2fs"
+                "${BUSYBOX}" rm -f "$img_path"
+                return 1
+            fi
+        else
+            error "No ext4 formatting tool available"
             "${BUSYBOX}" rm -f "$img_path"
             return 1
         fi
-    elif command -v mke2fs >/dev/null 2>&1; then
-        if ! mke2fs -t ext4 -F -L "ubuntu-chroot" "$img_path" 2>&1; then
-            error "Failed to format sparse image with mke2fs"
+    elif [ "$FSTYPE" = "f2fs" ]; then
+            if ! mkfs.f2fs -l "droidian" "$img_path" 2>&1; then
+            error "Failed to format sparse image with mkfs.f2fs"
             "${BUSYBOX}" rm -f "$img_path"
             return 1
         fi
-    else
-        error "No ext4 formatting tool available"
-        "${BUSYBOX}" rm -f "$img_path"
-        return 1
     fi
 
-    log "Sparse image created and formatted successfully"
+    log "Sparse image created and formatted successfully ($FSTYPE)"
     return 0
 }
 
@@ -202,13 +227,14 @@ mount_sparse_image() {
     local img_path="$1"
     local mount_path="$2"
 
-    log "Mounting sparse image to $mount_path"
+    log "Mounting sparse image ($FSTYPE) to $mount_path"
     "${BUSYBOX}" mkdir -p "$mount_path"
 
-    # Use busybox mount
-    if ! "${BUSYBOX}" mount -t ext4 -o loop,rw,noatime,nodiratime,data=ordered,commit=30 "$img_path" "$mount_path" 2>/dev/null; then
-        # Fallback to system mount if busybox mount fails
-        if ! mount -t ext4 -o loop,rw,noatime,nodiratime,data=ordered,commit=30 "$img_path" "$mount_path" 2>/dev/null; then
+    local mount_opts="loop,rw,noatime,nodiratime"
+    [ "$FSTYPE" = "ext4" ] && mount_opts="$mount_opts,data=ordered,commit=30"
+
+    if ! "${BUSYBOX}" mount -t "$FSTYPE" -o "$mount_opts" "$img_path" "$mount_path" 2>/dev/null; then
+        if ! mount -t "$FSTYPE" -o "$mount_opts" "$img_path" "$mount_path" 2>/dev/null; then
             error "Failed to mount sparse image"
             return 1
         fi
@@ -349,7 +375,7 @@ migrate_to_sparse() {
     log "Rootfs directory: $ROOTFS_DIR"
     log ""
     log "IMPORTANT: Your chroot is now using a sparse image."
-    log "To mount it, use: mount -t ext4 -o loop,rw,noatime,nodiratime,barrier=0 $ROOTFS_IMG $ROOTFS_DIR"
+    log "To mount it, use: mount -t $FSTYPE -o loop,rw,noatime,nodiratime $ROOTFS_IMG $ROOTFS_DIR"
 
     return 0
 }
@@ -372,6 +398,7 @@ case "$1" in
         echo ""
         echo "Options:"
         echo "  --chroot-dir DIR, -d DIR    Set chroot directory (default: $DEFAULT_CHROOT_DIR)"
+        echo "  --fstype TYPE, -t TYPE      Filesystem type: ext4 (default) or f2fs"
         echo "  --help, -h                  Show this help message"
         echo ""
         echo "Commands:"
@@ -383,16 +410,18 @@ case "$1" in
         echo "Examples:"
         echo "  $0 migrate 8"
         echo "  $0 --chroot-dir /custom/path migrate 16"
+        echo "  $0 --fstype f2fs migrate 8"
         echo "  CHROOT_DIR=/custom/path $0 migrate 8"
         echo ""
         echo "Description:"
         echo "  Migrates your existing Ubuntu chroot from a directory-based"
-        echo "  rootfs to a sparse ext4 image for better performance and"
+        echo "  rootfs to a sparse image for better performance and"
         echo "  space efficiency."
         echo ""
         echo "Requirements:"
         echo "  - busybox"
-        echo "  - mkfs.ext4 or mke2fs"
+        echo "  - mkfs.ext4 or mke2fs (for ext4)"
+        echo "  - mkfs.f2fs (for f2fs)"
         exit 1
         ;;
 esac

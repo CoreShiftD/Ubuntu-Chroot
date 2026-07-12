@@ -4,7 +4,7 @@
 
 (function(){
   // Use hardcoded paths provided by install.sh
-  const CHROOT_DIR = '/data/local/ubuntu-chroot';
+  const CHROOT_DIR = '/data/local/droidian';
   const PATH_CHROOT_SH = `${CHROOT_DIR}/chroot.sh`;
   const UPDATE_STATUS_SCRIPT = `${CHROOT_DIR}/update-status.sh`;
   const CHROOT_PATH_UI = `${CHROOT_DIR}/rootfs`;
@@ -2168,11 +2168,10 @@
     // Save selected user
     Storage.set('chroot_selected_user', selectedUser);
 
-    // Check if ubuntu-chroot command is available, otherwise fallback to full script path
-    let chrootCmd = 'ubuntu-chroot';
-    try {
-      if(rootAccessConfirmed && window.cmdExec && typeof window.cmdExec.execute === 'function') {
-        const checkCmd = await runCmdSync('command -v ubuntu-chroot 2>/dev/null || echo ""');
+  // Check if droidian command is available, otherwise fallback to full script path
+  let chrootCmd = 'droidian';
+  try{
+    const checkCmd = await runCmdSync('command -v droidian 2>/dev/null || echo ""');
         if(!checkCmd || !checkCmd.trim()) {
           // Command not found, use full script path
           chrootCmd = `sh ${PATH_CHROOT_SH}`;
@@ -3491,7 +3490,7 @@
     saveDebugMode();
     updateDebugIndicator();
     if(debugModeActive){
-      appendConsole('Debug mode enabled. All scripts will now log to /data/logs/ubuntu-chroot/logs', 'warn');
+      appendConsole('Debug mode enabled. All scripts will now log to /data/local/droidian/logs', 'warn');
     } else {
       appendConsole('Debug mode disabled', 'info');
     }

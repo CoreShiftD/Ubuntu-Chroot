@@ -36,7 +36,7 @@ on_install() {
     setup_chroot
     setup_ota
     extract_rootfs
-    create_symlink
+    create_droidian_cmd
 
     # Show update message if this is an update ZIP (check for marker file)
     if unzip -l "$ZIPFILE" 2>/dev/null | grep -q "\.is_update"; then
@@ -52,14 +52,14 @@ set_permissions() {
     set_perm_recursive $MODPATH 0 0 0755 0644
 
     # Set permissions for chroot scripts
-    set_perm "/data/local/ubuntu-chroot/chroot.sh" 0 0 0755
-    set_perm "/data/local/ubuntu-chroot/post_exec.sh" 0 0 0755
-    set_perm "/data/local/ubuntu-chroot/start-hotspot" 0 0 0755
-    set_perm "/data/local/ubuntu-chroot/update-status.sh" 0 0 0755
-    set_perm "/data/local/ubuntu-chroot/ota" 0 0 0755
-    set_perm "/data/local/ubuntu-chroot/ota/updater.sh" 0 0 0755
-    set_perm "/data/local/ubuntu-chroot/ota/updates.sh" 0 0 0755
-    set_perm "/data/local/ubuntu-chroot/sparsemgr.sh" 0 0 0755
+    set_perm "/data/local/droidian/chroot.sh" 0 0 0755
+    set_perm "/data/local/droidian/post_exec.sh" 0 0 0755
+    set_perm "/data/local/droidian/start-hotspot" 0 0 0755
+    set_perm "/data/local/droidian/update-status.sh" 0 0 0755
+    set_perm "/data/local/droidian/ota" 0 0 0755
+    set_perm "/data/local/droidian/ota/updater.sh" 0 0 0755
+    set_perm "/data/local/droidian/ota/updates.sh" 0 0 0755
+    set_perm "/data/local/droidian/sparsemgr.sh" 0 0 0755
 
     # Set permissions for module service script
     set_perm "$MODPATH/service.sh" 0 0 0755

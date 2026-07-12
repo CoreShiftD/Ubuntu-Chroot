@@ -3,10 +3,10 @@
 # Runs on boot after system is ready
 
 MODDIR=${0%/*}
-CHROOT_SH="/data/local/ubuntu-chroot/chroot.sh"
-BOOT_FLAG="/data/local/ubuntu-chroot/boot-service"
-LOG_FILE="/data/local/ubuntu-chroot/boot-service.log"
-UPDATE_STATUS_SCRIPT="/data/local/ubuntu-chroot/update-status.sh"
+CHROOT_SH="/data/local/droidian/chroot.sh"
+BOOT_FLAG="/data/local/droidian/boot-service"
+LOG_FILE="/data/local/droidian/boot-service.log"
+UPDATE_STATUS_SCRIPT="/data/local/droidian/update-status.sh"
 
 # Function to update module status
 update_module_status() {

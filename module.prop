@@ -1,4 +1,4 @@
-id=ubuntu-chroot
-name=Ubuntu Chroot
+id=droidian
+name=Droidian
 author=ravindu644
-description=A module for installing Ubuntu 24.04 rootfs on Android and managing it with a modern WebUI, featuring full hardware access and proper namespace isolation
+description=A module for installing Droidian rootfs on Android with full hardware access and proper namespace isolation

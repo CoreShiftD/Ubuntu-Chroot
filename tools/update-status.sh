@@ -5,11 +5,11 @@
 
 # Updates module.prop description with chroot status
 
-CHROOT_SH="/data/local/ubuntu-chroot/chroot.sh"
-CHROOT_PATH="/data/local/ubuntu-chroot/rootfs"
-ROOTFS_IMG="/data/local/ubuntu-chroot/rootfs.img"
-MODULE_PROP="/data/adb/modules/ubuntu-chroot/module.prop"
-DEFAULT_DESC="A module for installing Ubuntu 24.04 rootfs on Android and managing it with a modern WebUI, featuring full hardware access and proper namespace isolation"
+CHROOT_SH="/mnt/rootfs/chroot.sh"
+CHROOT_PATH="/mnt/rootfs/rootfs"
+ROOTFS_IMG="/mnt/rootfs/rootfs.img"
+MODULE_PROP="/data/adb/modules/droidian/module.prop"
+DEFAULT_DESC="A module for installing Droidian rootfs on Android and managing it with a modern WebUI, featuring full hardware access and proper namespace isolation"
 
 # Check if chroot is running
 check_status() {
