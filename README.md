@@ -564,6 +564,7 @@ CONFIG_SYSVIPC_SYSCTL=y
 - [Kali NetHunter project](https://gitlab.com/kalilinux/nethunter) for my own understanding of chroot and sysctl commands
 - [Chroot-distro](https://github.com/Magisk-Modules-Alt-Repo/chroot-distro) for the internet connectivity fix in initial versions
 - [Brutal-Busybox](https://github.com/feravolt/Brutal_busybox) for the statically-linked aarch64 BusyBox binary used in various scripts to perform certain operations.
+- [initd](https://github.com/EdwardLab/initd) for the systemd-compatible init daemon and systemctl binary used for service management inside the chroot.
 - [docker-systemctl-replacement](https://github.com/gdraheim/docker-systemctl-replacement) for [systemctl](./Docker/scripts/systemctl3.py) implementation in chroot
 - [optimizer](https://github.com/OptimizerS1) for the cool banner design :)
 - [Maxim-Root](https://github.com/Maxim-Root) for providing me with a server and additional resources for the project
